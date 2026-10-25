@@ -1,115 +1,160 @@
-# Colony: One Tournament Environment
+# Colony One: Neural Network Experiments
 
-Train a policy-value model for Colony: One and submit one ONNX file. The
-tournament runs every submission through the same MCTS; your model supplies
-policy logits and a position value.
+A compact CNN-based policy-value model for the Colony: One strategy game, explored through supervised learning, self-play experiments, Monte Carlo Tree Search (MCTS), and ONNX deployment.
 
-## Build your first model
+This project documents an experimental machine-learning pipeline built around the Colony: One tournament environment. The goal was to explore how a small neural network can provide policy logits and position-value estimates to a search-based game agent.
 
-Requires **Python 3.11, 3.12, 3.13 or 3.14** (64-bit). Python 3.10 and Intel Macs are not supported:
-the required `onnxruntime` cannot be installed there. Install inside the unzipped folder, preferably
-in a fresh virtual environment:
+> **Research status:** Experimental portfolio project. The trained model met the ONNX submission interface requirements, but the experiments did not demonstrate an improvement over the original model against the GreedyAgent baseline.
+
+## Overview
+
+The project explores four stages:
+
+1. **Model design** — a compact convolutional neural network with policy and value heads.
+2. **Data generation** — self-play experiments and positions generated from GreedyAgent games.
+3. **Training** — supervised policy learning and value regression using PyTorch.
+4. **Deployment and evaluation** — ONNX export and evaluation with MCTS against GreedyAgent.
+
+## Model architecture
+
+The `TinyColonyNet` model accepts a batch of encoded board observations and returns action scores and a value estimate.
+
+| Component | Design |
+|---|---|
+| Input | Float32 tensor shaped `(batch, 16, 8, 8)` |
+| Feature extractor | Two 3×3 convolution layers with 16 channels and ReLU activations |
+| Policy head | 1×1 convolution, flattening, and a linear layer |
+| Policy output | 4096 action logits per position |
+| Value head | Global average pooling followed by fully connected layers |
+| Value output | Scalar per position, constrained to `[-1, 1]` using `tanh` |
+
+The policy head produces logits, not probabilities. During training, the logits are passed through `log_softmax` to calculate the policy loss. The value head estimates the position value from the current player's perspective.
+
+## Learning experiments
+
+### 1. Random-output self-play data
+
+An initial dataset was generated using a random evaluator. This was useful for exercising the data pipeline, but it should not be treated as strategically informative training data.
+
+### 2. GreedyAgent imitation and value learning
+
+A dataset was generated from GreedyAgent-versus-GreedyAgent games. Each position records the observation, a one-hot policy target for the action selected by the agent, and a terminal outcome value.
+
+The training script combines:
+
+- Policy cross-entropy against the target action distribution.
+- Mean squared error (MSE) between predicted and target values.
+- Adam optimization.
+- A fixed random seed for reproducibility.
+- A held-out validation split and early stopping.
+
+### 3. Guided self-play
+
+A small guided self-play experiment was also conducted. Its dataset contained only 76 positions, so it is preliminary evidence that the pipeline ran—not evidence of strong self-play learning.
+
+## Evaluation
+
+The model was evaluated against GreedyAgent using MCTS with 60 simulations per move and a fixed seed configuration.
+
+| Model | Wins in 20 games |
+|---|---:|
+| Original model | 7/20 (35%) |
+| Greedy-data-trained model | 6/20 (30%) |
+
+The observed difference is small and does not establish that either model is stronger. Twenty games are insufficient for a confident comparison, and results may depend on seeds, sides, game dynamics, and training data.
+
+The original ONNX model also passed the provided submission validator. Validation confirms interface compatibility and execution under the validator; it does not establish strategic strength.
+
+## Repository structure
+
+```text
+.
+├── colony_one/              # Colony: One environment and search components
+├── docs/                    # Environment documentation
+├── play/                    # Model play utilities
+├── tools/                   # Validation utilities
+├── tiny_colony_net.py       # CNN policy-value architecture
+├── train_model.py           # Initial self-play training
+├── train_greedy_data.py     # GreedyAgent dataset generation
+├── train_greedy_model.py    # Training on GreedyAgent data
+├── train_guided_selfplay.py # Guided self-play experiment
+├── evaluate_greedy.py       # MCTS evaluation against GreedyAgent
+├── export_onnx.py           # Export original model to ONNX
+├── export_greedy_onnx.py    # Export trained model to ONNX
+├── model.onnx               # Original exported model
+├── model_greedy.onnx        # Greedy-data-trained model
+└── greedy_data.npz          # GreedyAgent-generated dataset
+```
+
+The environment, rules, and supporting files are included from the underlying Colony: One project. Consult the included `LICENSE` before using or redistributing the code. The experimental scripts and model architecture are the focus of this portfolio; the entire upstream framework should not be assumed to be original work.
+
+## Reproducibility
+
+The project uses Python and PyTorch for training, NumPy for dataset handling, and ONNX Runtime for inference through the environment's evaluation utilities.
+
+Use a compatible Python environment and install the dependencies specified by the project. The commands below assume the environment's dependencies have been installed and the corresponding dataset/checkpoint files are available.
+
+Run a model shape check:
 
 ```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate      macOS / Linux: source .venv/bin/activate
-pip install -e .
+python tiny_colony_net.py
 ```
 
-```python
-import numpy as np
-
-from colony_one import ColonyOneEnv
-
-env = ColonyOneEnv(seed=0)
-observation = env.reset()  # float32, shape (16, 8, 8)
-
-while not env.terminated:
-    legal = env.legal_mask()                 # bool, shape (4096,)
-    logits = np.zeros(4096, dtype=np.float32)  # replace with your model
-    logits[~legal] = -np.inf
-    action = int(np.argmax(logits))
-    observation, reward, terminated, info = env.step(action)
-```
-
-`step()` applies one **action**, not one turn. A team takes two consecutive
-actions; always read `env.current_team` after each step.
-
-Your ONNX model must implement:
-
-| Tensor | Shape | Type | Meaning |
-|---|---|---|---|
-| input `observation` | `(batch, 16, 8, 8)` | `float32` | canonical state |
-| output `policy` | `(batch, 4096)` | `float32` | raw action logits |
-| output `value` | `(batch,)` | `float32` | side-to-move value in `[-1, 1]` |
-
-The batch axis must be dynamic. Validate every export:
+Train on GreedyAgent-generated data:
 
 ```bash
-python tools/validate_submission.py model.onnx
+python train_greedy_model.py
 ```
 
-`ACCEPTED` means the file meets the tournament submission contract.
-
-## Train with MCTS
-
-The tournament chooses every action using the published MCTS implementation.
-For AlphaZero-style self-play, use the same search with an evaluator callable:
-
-```python
-from colony_one import mcts
-
-action = mcts.search_action(
-    env.board,
-    env.current_team,
-    env.actions_left,
-    env.round_number,
-    evaluator,  # (B, 16, 8, 8) -> ((B, 4096), (B,))
-    mcts.MCTSConfig(),
-)
-```
-
-Call it once per action, including a team's second action. `MCTSConfig()` holds
-the referee's search settings (root noise and opening visit sampling; see
-[submission.md](docs/submission.md#the-referees-settings) for the exact schedule).
-The server sets the number of simulations per action: **60 in Level 3** and
-**100 in the Level 4 tournament**. Use `mcts.MCTSConfig(simulations=60)` to
-reproduce Level 3 locally; the default of 300 is only a local default.
-
-## Required reading
-
-- [Observation and actions](docs/observation.md): canonical tensor, action
-  indices, legal masking, and value target.
-- [Submission](docs/submission.md): ONNX restrictions and referee MCTS.
-- [Rules](docs/rules.md): complete game rules.
-
-## Optional local matches
-
-Run a model against another model under referee MCTS:
+Export the trained checkpoint:
 
 ```bash
-python play/model_vs_model.py --model-a model.onnx --model-b play/random.onnx --games 50
-python play/model_vs_model.py --model-a model.onnx --model-b other.onnx --games 50
+python export_greedy_onnx.py
 ```
 
-`play/random.onnx` is the shipped random model. Sides are alternated across games.
+Evaluate an ONNX model against GreedyAgent:
 
-## Ascension chart in level 4 dashboard
-The Ascension chart plots the rating after each match over the last 30 minutes for
-you and up to four rivals:
+```bash
+python evaluate_greedy.py --model model_greedy.onnx --games 20 --simulations 60 --seed 42
+```
 
-- **Most played #1–#3** – the three opponents you have played the most games
-  against (all-time, not just the last 30 minutes).
-- **Best beaten opponent** – the highest-rated opponent you have beaten at least
-  once, other than the three above.
+Validate an ONNX export:
 
-You may see fewer rivals early on (if you have few opponents or no wins yet).
+```bash
+python tools/validate_submission.py model_greedy.onnx
+```
 
-## Reference Material
+These commands depend on the underlying environment and the expected files being present. Training and evaluation results may vary with software versions, seeds, and runtime conditions.
 
-- `colony_one/mcts.py`: exact referee search implementation.
-- `play/random.onnx`: minimal valid random ONNX submission.
+## Limitations
 
-## License
+- The evaluation sample is small and does not establish statistically reliable strength differences.
+- GreedyAgent-generated data teaches the model to imitate the baseline's actions; it does not provide an independent source of stronger strategy.
+- The initial random-evaluator dataset is not strategically informative.
+- The guided self-play dataset is too small to support conclusions about learning quality.
+- Passing the ONNX validator demonstrates interface compliance, not playing strength.
+- The project does not establish superiority over GreedyAgent or demonstrate state-of-the-art performance.
 
-See [LICENSE](LICENSE).
+## Future work
+
+- Run larger evaluations across multiple seeds and both player sides.
+- Record complete training curves and dataset statistics.
+- Compare against random and greedy baselines under a consistent evaluation protocol.
+- Investigate stronger target policies and more informative self-play.
+- Add automated tests for tensor shapes, export compatibility, and evaluation reproducibility.
+
+## Documentation
+
+- [Technical White Paper](research/technical-white-paper.md) — Detailed
+  documentation of the model architecture, training experiments, evaluation,
+  results, limitations, and lessons learned.
+
+## Attribution and license
+
+This project builds on the Colony: One tournament environment. The included `LICENSE` identifies the original copyright holder and specifies conditions on non-commercial distribution, commercial use, event use, and derivative works.
+
+Preserve the original license and attribution. Do not assume that publishing this repository grants permission for uses prohibited by the license. Seek written clarification from the copyright holder if needed.
+
+---
+
+**Project focus:** neural network engineering, supervised learning, model export, reproducible evaluation, and documenting negative results honestly.
